@@ -5,6 +5,7 @@ Requires: requests
 """
 import json
 import os
+import sys
 import threading
 import webbrowser
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -18,6 +19,7 @@ import requests
 # ── Configuration ─────────────────────────────────────────────────────────────
 
 VERSION        = "0.5.0.0"
+_BASE          = Path(getattr(sys, "_MEIPASS", Path(__file__).parent))
 OAUTH_PORT     = 17243
 POLL_INTERVAL    = 2.0       # seconds between file checks
 RETRY_INTERVAL   = 20        # seconds between server connection retries
@@ -241,6 +243,10 @@ class App(tk.Tk):
         self.title(f"Marbles on Teams  v{VERSION}")
         self.resizable(False, False)
         self.configure(bg=BG)
+        try:
+            self.iconbitmap(str(_BASE / "logo.ico"))
+        except Exception:
+            pass
         self._build_ui()
         self._apply_saved_state()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -483,9 +489,16 @@ class App(tk.Tk):
 
     def _update_chat_lbl(self, active: bool):
         if active:
-            self._chat_lbl.configure(text="● Chat: Active", fg=GREEN)
+            self._chat_lbl.configure(text="● Chat: Active", fg=GREEN, cursor="")
+            self._chat_lbl.unbind("<Button-1>")
         else:
-            self._chat_lbl.configure(text="● Chat: Inactive", fg=MUTED)
+            server = self.cfg.get("server_url", SERVER_URL).rstrip("/")
+            self._chat_lbl.configure(
+                text="● Chat: Inactive — click here to link your broadcaster account →",
+                fg=ACCENT, cursor="hand2"
+            )
+            self._chat_lbl.bind("<Button-1>",
+                                lambda e: webbrowser.open(server + "/#config"))
 
     def _restart_watcher(self):
         if self.watcher:
