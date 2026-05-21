@@ -295,17 +295,20 @@ class App(tk.Tk):
         self._watch_lbl.pack(anchor="w")
         self._chat_lbl = tk.Label(body, text="", bg=BG, fg=MUTED, font=FONT_SM)
         self._chat_lbl.pack(anchor="w", pady=(0, 4))
-        self._token_warn = tk.Label(body, text="", bg="#2a1500", fg=ACCENT,
+
+        # Warning banners — hidden by default, shown via grid() when needed
+        _wf = tk.Frame(body, bg=BG)
+        _wf.pack(fill="x")
+        _wf.columnconfigure(0, weight=1)
+        self._token_warn = tk.Label(_wf, text="", bg="#2a1500", fg=ACCENT,
                                     font=FONT_SM, anchor="w", cursor="hand2",
                                     wraplength=380, justify="left", padx=6, pady=4)
         self._token_warn.bind("<Button-1>", lambda e: self._open_dashboard())
-        self._token_warn.pack(fill="x", pady=(0, 2))
-        self._update_warn = tk.Label(body, text="", bg="#0a1a2a", fg=BLUE,
+        self._update_warn = tk.Label(_wf, text="", bg="#0a1a2a", fg=BLUE,
                                      font=FONT_SM, anchor="w", cursor="hand2",
                                      wraplength=380, justify="left", padx=6, pady=4)
         self._update_warn.bind("<Button-1>", lambda e: webbrowser.open(
-            self.cfg.get("server_url", SERVER_URL).rstrip("/") + "/companion/download"))
-        self._update_warn.pack(fill="x", pady=(0, 4))
+            self.cfg.get("server_url", SERVER_URL).rstrip("/") + "/companion/download/exe"))
 
         # Activity log
         self._section(body, "Activity")
@@ -421,9 +424,13 @@ class App(tk.Tk):
             pass
 
     def _set_token_warn(self, show: bool):
-        self._token_warn.configure(
-            text="⚠ Broadcaster account not linked — race results & chat won't post. Click here to open Dashboard →" if show else ""
-        )
+        if show:
+            self._token_warn.configure(
+                text="⚠ Broadcaster account not linked — race results & chat won't post. Click here to open Dashboard →"
+            )
+            self._token_warn.grid(row=0, column=0, sticky="ew", pady=(0, 2))
+        else:
+            self._token_warn.grid_remove()
 
     def _check_for_update(self):
         try:
@@ -431,8 +438,8 @@ class App(tk.Tk):
             r = requests.get(server.rstrip("/") + "/companion/version", timeout=5)
             latest = r.json().get("version", "")
             if latest and latest != VERSION:
-                self.after(0, self._update_warn.configure,
-                           {"text": f"↑ Update available (v{latest}) — click to download"})
+                self._update_warn.configure(text=f"↑ Update available (v{latest}) — click to download")
+                self.after(0, lambda: self._update_warn.grid(row=1, column=0, sticky="ew", pady=(0, 4)))
         except Exception:
             pass
 
