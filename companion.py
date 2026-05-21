@@ -1,5 +1,5 @@
 """
-Marbles on Teams — Companion  v0.5.0.0
+Marbles on Teams — Companion  v0.5.0.1
 Watches the Marbles on Stream save folder and sends results to the MoT server.
 Requires: requests
 """
@@ -18,7 +18,7 @@ import requests
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
-VERSION        = "0.5.0.0"
+VERSION        = "0.5.0.1"
 _BASE          = Path(getattr(sys, "_MEIPASS", Path(__file__).parent))
 OAUTH_PORT     = 17243
 POLL_INTERVAL    = 2.0       # seconds between file checks
