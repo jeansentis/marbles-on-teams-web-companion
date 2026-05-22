@@ -1,5 +1,5 @@
 """
-Marbles on Teams — Companion  v0.5.0.1
+Marbles on Teams — Companion  v0.5.1.0
 Watches the Marbles on Stream save folder and sends results to the MoT server.
 Requires: requests
 """
@@ -18,8 +18,16 @@ import requests
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
-VERSION        = "0.5.0.1"
+VERSION        = "0.5.1.0"
 _BASE          = Path(getattr(sys, "_MEIPASS", Path(__file__).parent))
+_EXE_DIR       = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).parent
+
+OBS_FILES = {
+    "total_pts":     "MoT_TotalPoints.txt",
+    "pts_today":     "MoT_PointsToday.txt",
+    "world_records": "MoT_WorldRecords.txt",
+    "avg_ppr":       "MoT_AvgPointsPerRace.txt",
+}
 OAUTH_PORT     = 17243
 POLL_INTERVAL    = 2.0       # seconds between file checks
 RETRY_INTERVAL   = 20        # seconds between server connection retries
@@ -152,6 +160,7 @@ class Watcher(threading.Thread):
     def run(self):
         self._snapshot()
         self._heartbeat()
+        self._fetch_obs_stats()
         _ping_counter = 0
         while not self._stop.wait(POLL_INTERVAL):
             _ping_counter += 1
@@ -179,6 +188,24 @@ class Watcher(threading.Thread):
             elif "LastSeasonRoyale.csv" in changed:
                 self._post_royale(changed["LastSeasonRoyale.csv"])
 
+    def _write_obs_stats(self, stats: dict):
+        for key, filename in OBS_FILES.items():
+            try:
+                (_EXE_DIR / filename).write_text(str(stats.get(key, 0)), encoding="utf-8")
+            except Exception:
+                pass
+
+    def _fetch_obs_stats(self):
+        try:
+            r = requests.get(
+                self.server_url + f"/leaderboard/streamers/{self.username}/obs-stats",
+                timeout=10,
+            )
+            if r.ok:
+                self._write_obs_stats(r.json())
+        except Exception:
+            pass
+
     def _post_race(self, content: str, map_csv: str = ""):
         payload = {
             "streamer_username": self.username,
@@ -195,6 +222,7 @@ class Watcher(threading.Thread):
             self.on_event(f"Race saved{map_label} — {data['entries_saved']} players", "success")
             if data.get("new_world_record"):
                 self.on_event(f"  🏅 NEW WORLD RECORD — {data['wr_holder']}!", "wr")
+            threading.Thread(target=self._fetch_obs_stats, daemon=True).start()
         except requests.ConnectionError:
             self.on_event("Cannot reach server.", "error")
         except Exception as exc:
@@ -209,6 +237,7 @@ class Watcher(threading.Thread):
                 self.on_event(f"Royale ingest error: {data.get('detail')}", "error")
                 return
             self.on_event(f"Royale saved — {data['entries_saved']} players", "success")
+            threading.Thread(target=self._fetch_obs_stats, daemon=True).start()
         except requests.ConnectionError:
             self.on_event("Cannot reach server.", "error")
         except Exception as exc:
@@ -302,6 +331,22 @@ class App(tk.Tk):
         self._chat_lbl = tk.Label(body, text="", bg=BG, fg=MUTED, font=FONT_SM)
         self._chat_lbl.pack(anchor="w", pady=(0, 4))
 
+        # OBS text files
+        self._section(body, "OBS Text Files")
+        obs_row = tk.Frame(body, bg=BG)
+        obs_row.pack(fill="x", pady=(0, 4))
+        self._obs_lbl = tk.Label(obs_row, text=str(_EXE_DIR), bg=BG, fg=MUTED,
+                                 font=FONT_SM, anchor="w")
+        self._obs_lbl.pack(side="left", fill="x", expand=True)
+        tk.Button(obs_row, text="Open Folder", bg=SURFACE, fg=TEXT,
+                  font=FONT_SM, relief="flat", bd=0, padx=8,
+                  activebackground=BORDER,
+                  command=lambda: os.startfile(str(_EXE_DIR))).pack(side="right")
+        tk.Label(body,
+                 text="MoT_TotalPoints.txt  •  MoT_PointsToday.txt  •  MoT_WorldRecords.txt  •  MoT_AvgPointsPerRace.txt",
+                 bg=BG, fg=MUTED, font=("Segoe UI", 7), wraplength=390, justify="left",
+                 ).pack(anchor="w", pady=(0, 6))
+
         # Warning banners — hidden by default, shown via grid() when needed
         _wf = tk.Frame(body, bg=BG)
         _wf.pack(fill="x")
@@ -334,7 +379,7 @@ class App(tk.Tk):
                   activebackground=BORDER,
                   command=self._open_dashboard).pack(side="left")
 
-        self.geometry("420x500")
+        self.geometry("420x560")
 
     def _section(self, parent, label: str):
         tk.Label(parent, text=label.upper(), bg=BG, fg=MUTED,
