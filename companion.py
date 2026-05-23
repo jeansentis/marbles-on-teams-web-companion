@@ -1,5 +1,5 @@
 """
-Marbles on Teams — Companion  v0.5.1.0
+Marbles on Teams — Companion  v0.5.2.0
 Watches the Marbles on Stream save folder and sends results to the MoT server.
 Requires: requests
 """
@@ -18,7 +18,7 @@ import requests
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
-VERSION        = "0.5.1.0"
+VERSION        = "0.5.2.0"
 _BASE          = Path(getattr(sys, "_MEIPASS", Path(__file__).parent))
 _EXE_DIR       = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).parent
 
@@ -159,6 +159,7 @@ class Watcher(threading.Thread):
 
     def run(self):
         self._snapshot()
+        self._ensure_obs_files()
         self._heartbeat()
         self._fetch_obs_stats()
         _ping_counter = 0
@@ -187,6 +188,16 @@ class Watcher(threading.Thread):
                 self._post_race(changed["LastSeasonRace.csv"], map_csv)
             elif "LastSeasonRoyale.csv" in changed:
                 self._post_royale(changed["LastSeasonRoyale.csv"])
+
+    def _ensure_obs_files(self):
+        """Create OBS txt files with default value 0 if they don't exist yet."""
+        for filename in OBS_FILES.values():
+            p = _EXE_DIR / filename
+            if not p.exists():
+                try:
+                    p.write_text("0", encoding="utf-8")
+                except Exception:
+                    pass
 
     def _write_obs_stats(self, stats: dict):
         for key, filename in OBS_FILES.items():
