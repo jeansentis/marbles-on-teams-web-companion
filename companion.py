@@ -1,5 +1,5 @@
 """
-Marbles on Teams — Companion  v0.5.2.0
+Marbles on Teams — Companion  v0.5.3.0
 Watches the Marbles on Stream save folder and sends results to the MoT server.
 Requires: requests
 """
@@ -18,7 +18,7 @@ import requests
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
-VERSION        = "0.5.2.0"
+VERSION        = "0.5.3.0"
 _BASE          = Path(getattr(sys, "_MEIPASS", Path(__file__).parent))
 _EXE_DIR       = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).parent
 
@@ -207,15 +207,19 @@ class Watcher(threading.Thread):
                 pass
 
     def _fetch_obs_stats(self):
+        import time as _time
         try:
             r = requests.get(
                 self.server_url + f"/leaderboard/streamers/{self.username}/obs-stats",
+                params={"_t": int(_time.time())},
                 timeout=10,
             )
             if r.ok:
                 self._write_obs_stats(r.json())
-        except Exception:
-            pass
+            else:
+                self.on_event(f"Stats fetch failed ({r.status_code})", "error")
+        except Exception as exc:
+            self.on_event(f"Stats fetch error: {exc}", "error")
 
     def _post_race(self, content: str, map_csv: str = ""):
         payload = {
