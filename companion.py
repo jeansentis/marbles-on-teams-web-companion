@@ -57,6 +57,64 @@ def save_cfg(cfg: dict) -> None:
     CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
     CONFIG_PATH.write_text(json.dumps(cfg, indent=2))
 
+
+def _search_save_folder():
+    """Find the MarblesOnStream save folder that holds the result CSVs.
+    Returns a Path or None. Scans only known app-data locations (fast + bounded);
+    the MarblesOnStream subtree is small so a full walk of it is cheap."""
+    home = Path.home()
+    parents = []
+    for env in ("LOCALAPPDATA", "APPDATA"):
+        v = os.environ.get(env)
+        if v:
+            parents.append(Path(v))
+    parents += [
+        home / "AppData" / "Local",
+        home / "AppData" / "LocalLow",
+        home / "AppData" / "Roaming",
+        home / "Documents",
+        home / "OneDrive" / "Documents",
+        home / "Saved Games",
+        home,
+    ]
+    # Existing MarblesOnStream roots under those parents (de-duped).
+    roots, seen = [], set()
+    for p in parents:
+        cand = p / "MarblesOnStream"
+        try:
+            if cand.exists():
+                key = str(cand).lower()
+                if key not in seen:
+                    seen.add(key)
+                    roots.append(cand)
+        except Exception:
+            pass
+
+    # Prefer the folder whose result CSV was written most recently (the live save).
+    targets = {"LastSeasonRace.csv", "LastSeasonRoyale.csv"}
+    best, best_mtime = None, -1.0
+    for root in roots:
+        for dirpath, _dirs, files in os.walk(root):
+            for f in targets.intersection(files):
+                try:
+                    m = (Path(dirpath) / f).stat().st_mtime
+                except OSError:
+                    m = 0.0
+                if m > best_mtime:
+                    best, best_mtime = Path(dirpath), m
+    if best is not None:
+        return best
+
+    # No result files yet — fall back to any SaveGames folder so it's set for later.
+    for root in roots:
+        sg = root / "Saved" / "SaveGames"
+        if sg.exists():
+            return sg
+        for dirpath, _dirs, _files in os.walk(root):
+            if Path(dirpath).name.lower() == "savegames":
+                return Path(dirpath)
+    return None
+
 # ── Twitch OAuth ──────────────────────────────────────────────────────────────
 
 class _OAuthHandler(BaseHTTPRequestHandler):
@@ -397,6 +455,10 @@ class App(tk.Tk):
                   font=FONT_SM, relief="flat", bd=0, padx=8,
                   activebackground=BORDER,
                   command=self._browse_folder).pack(side="right")
+        self._autofind_btn = tk.Button(folder_row, text="Auto Find", bg=ACCENT, fg="#111",
+                  font=FONT_SM, relief="flat", bd=0, padx=8,
+                  activebackground=GOLD, command=self._auto_find_folder)
+        self._autofind_btn.pack(side="right", padx=(0, 4))
 
         # Watcher status
         self._watch_lbl = tk.Label(body, text="", bg=BG, fg=MUTED, font=FONT_SM)
@@ -553,6 +615,39 @@ class App(tk.Tk):
             save_cfg(self.cfg)
             self._folder_lbl.configure(text=path, fg=TEXT)
             self._restart_watcher()
+
+    # ── Auto-find save folder ─────────────────────────────────────────────────
+
+    def _auto_find_folder(self):
+        """Search common MarblesOnStream locations for the folder that actually
+        holds the result CSVs, then select it. Runs off the UI thread."""
+        self._autofind_btn.configure(state="disabled", text="Searching…")
+        self._log_msg("Searching for your MarblesOnStream save folder…", "info")
+
+        def _do():
+            found = None
+            try:
+                found = _search_save_folder()
+            except Exception as exc:
+                self.after(0, self._log_msg, f"Auto-find error: {exc}", "error")
+            self.after(0, self._auto_find_done, found)
+
+        threading.Thread(target=_do, daemon=True).start()
+
+    def _auto_find_done(self, found):
+        self._autofind_btn.configure(state="normal", text="Auto Find")
+        if found:
+            path = str(found)
+            self.cfg["save_folder"] = path
+            save_cfg(self.cfg)
+            self._folder_lbl.configure(text=path, fg=TEXT)
+            self._log_msg(f"Found save folder: {path}", "success")
+            self._restart_watcher()
+        else:
+            self._log_msg(
+                "Couldn't auto-find the save folder. Click Browse and pick the folder "
+                "that contains LastSeasonRace.csv (usually under "
+                "%LOCALAPPDATA%\\MarblesOnStream\\Saved\\SaveGames).", "error")
 
     def _open_dashboard(self):
         webbrowser.open(self.cfg.get("server_url", SERVER_URL))
