@@ -337,6 +337,8 @@ class App(tk.Tk):
         self.watcher: Watcher | None = None
         self._retry_job = None
         self._chat_poll_job = None
+        self._chat_tick_job = None
+        self._chat_remaining = 0
         self._was_connected = None
         self._reconnect_remaining = 0
 
@@ -611,42 +613,77 @@ class App(tk.Tk):
         self._watch_lbl.configure(text=f"● Watching {folder.name}", fg=GREEN)
         self._log_msg(f"Watching {folder}", "info")
         threading.Thread(target=self._check_token_linked, daemon=True).start()
-        if self._chat_poll_job:
-            self.after_cancel(self._chat_poll_job)
-        self._poll_chat_status()
+        self._start_chat_monitor()
 
-    def _poll_chat_status(self):
+    # ── Chat / IRC status with a live reconnect countdown ─────────────────────
+
+    def _cancel_chat_jobs(self):
+        for attr in ("_chat_poll_job", "_chat_tick_job"):
+            job = getattr(self, attr, None)
+            if job:
+                self.after_cancel(job)
+                setattr(self, attr, None)
+
+    def _start_chat_monitor(self):
+        self._cancel_chat_jobs()
+        self._chat_check_now()
+
+    def _chat_check_now(self):
+        self._chat_poll_job = None
         threading.Thread(target=self._fetch_chat_status, daemon=True).start()
-        self._chat_poll_job = self.after(30_000, self._poll_chat_status)
 
     def _fetch_chat_status(self):
         username = self.cfg.get("twitch_login")
         server   = self.cfg.get("server_url", SERVER_URL)
         if not username or not server:
             return
+        active = False
         try:
-            r = requests.get(
-                server.rstrip("/") + f"/ingest/ping/{username}",
-                timeout=5,
-            )
-            d = r.json()
-            active = d.get("chat_active", False)
-            self.after(0, self._update_chat_lbl, active)
+            r = requests.get(server.rstrip("/") + f"/ingest/ping/{username}", timeout=5)
+            active = r.json().get("chat_active", False)
         except Exception:
             pass
+        self.after(0, self._update_chat_lbl, active)
 
     def _update_chat_lbl(self, active: bool):
+        self._cancel_chat_jobs()
         if active:
             self._chat_lbl.configure(text="● Chat: Active", fg=GREEN, cursor="")
             self._chat_lbl.unbind("<Button-1>")
+            # routine re-check so a drop is noticed
+            self._chat_poll_job = self.after(30_000, self._chat_check_now)
         else:
-            server = self.cfg.get("server_url", SERVER_URL).rstrip("/")
-            self._chat_lbl.configure(
-                text="● Chat: Inactive — click here to link your broadcaster account →",
-                fg=ACCENT, cursor="hand2"
-            )
-            self._chat_lbl.bind("<Button-1>",
-                                lambda e: webbrowser.open(server + "/#config"))
+            self._chat_lbl.configure(cursor="hand2")
+            self._chat_lbl.bind("<Button-1>", lambda e: self._chat_reconnect_now())
+            self._chat_remaining = 30
+            self._tick_chat()
+
+    def _tick_chat(self):
+        n = self._chat_remaining
+        if n <= 0:
+            self._chat_check_now()      # time's up — re-check (auto-reconnects server-side)
+            return
+        self._chat_lbl.configure(
+            text=f"● Chat: reconnecting… {n}s — click here to reconnect now", fg=ACCENT)
+        self._chat_remaining = n - 1
+        self._chat_tick_job = self.after(1000, self._tick_chat)
+
+    def _chat_reconnect_now(self):
+        """Force the server to (re)start the IRC listener for this channel, then re-check."""
+        self._cancel_chat_jobs()
+        self._chat_lbl.configure(text="● Chat: reconnecting…", fg=ACCENT, cursor="")
+        def _do():
+            username = self.cfg.get("twitch_login")
+            server   = self.cfg.get("server_url", SERVER_URL)
+            if not username or not server:
+                return
+            try:
+                requests.post(server.rstrip("/") + "/ingest/ping",
+                              json={"streamer_username": username}, timeout=5)
+            except Exception:
+                pass
+            self._fetch_chat_status()
+        threading.Thread(target=_do, daemon=True).start()
 
     def _restart_watcher(self):
         if self.watcher:
