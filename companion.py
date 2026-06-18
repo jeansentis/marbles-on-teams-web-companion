@@ -1,5 +1,5 @@
 """
-Marbles on Teams — Companion  v0.5.3.0
+Marbles on Teams — Companion  v0.5.4.0
 Watches the Marbles on Stream save folder and sends results to the MoT server.
 Requires: requests
 """
@@ -18,7 +18,7 @@ import requests
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
-VERSION        = "0.5.3.0"
+VERSION        = "0.5.4.0"
 _BASE          = Path(getattr(sys, "_MEIPASS", Path(__file__).parent))
 _EXE_DIR       = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).parent
 
@@ -147,18 +147,60 @@ class Watcher(threading.Thread):
             except FileNotFoundError:
                 pass
 
+    def _file_status(self) -> dict:
+        """Which watched files currently exist — reported to the server so the
+        admin diagnostics panel can show save-file presence per streamer."""
+        out = {}
+        for filename in WATCHED:
+            try:
+                out[filename] = (self.folder / filename).exists()
+            except Exception:
+                out[filename] = False
+        return out
+
     def _heartbeat(self):
         try:
+            try:
+                folder_exists = self.folder.exists()
+            except Exception:
+                folder_exists = False
             requests.post(
                 self.server_url + "/ingest/ping",
-                json={"streamer_username": self.username},
+                json={
+                    "streamer_username": self.username,
+                    "folder_exists":     folder_exists,
+                    "files":             self._file_status(),
+                },
                 timeout=5,
             )
         except Exception:
             pass
 
+    def _check_files(self):
+        """One-shot save-folder/file diagnostic posted to the activity log, so a
+        wrong folder (the usual cause of 'running but never sends') is visible."""
+        try:
+            exists = self.folder.exists()
+        except Exception:
+            exists = False
+        if not exists:
+            self.on_event(f"⚠ Save folder not found: {self.folder}", "error")
+            self.on_event("   Click Browse and select your MarblesOnStream 'SaveGames' folder.", "error")
+            return
+        found  = self._file_status()
+        race   = found.get("LastSeasonRace.csv")
+        royale = found.get("LastSeasonRoyale.csv")
+        if not race and not royale:
+            self.on_event("⚠ No race/royale result files in this folder yet.", "error")
+            self.on_event("   If you've already run races, this is the wrong folder "
+                          "(or they're in a sub-folder) — click Browse.", "error")
+        else:
+            present = [f for f, ok in found.items() if ok]
+            self.on_event("Save folder OK — found: " + ", ".join(present), "success")
+
     def run(self):
         self._snapshot()
+        self._check_files()
         self._ensure_obs_files()
         self._heartbeat()
         self._fetch_obs_stats()
@@ -229,9 +271,15 @@ class Watcher(threading.Thread):
         }
         try:
             resp = requests.post(self.server_url + "/ingest/race", json=payload, timeout=15)
-            data = resp.json()
+            try:
+                data = resp.json()
+            except Exception:
+                data = {}
+            if resp.status_code == 409:
+                self.on_event("Race not saved — Twitch shows you offline. Results only save while you're live.", "error")
+                return
             if not resp.ok:
-                self.on_event(f"Race ingest error: {data.get('detail')}", "error")
+                self.on_event(f"Race ingest error ({resp.status_code}): {data.get('detail') or 'server error'}", "error")
                 return
             map_label = f' on "{data["map_name"]}"' if data.get("map_name") else ""
             self.on_event(f"Race saved{map_label} — {data['entries_saved']} players", "success")
@@ -247,9 +295,15 @@ class Watcher(threading.Thread):
         payload = {"streamer_username": self.username, "csv_content": content}
         try:
             resp = requests.post(self.server_url + "/ingest/royale", json=payload, timeout=15)
-            data = resp.json()
+            try:
+                data = resp.json()
+            except Exception:
+                data = {}
+            if resp.status_code == 409:
+                self.on_event("Royale not saved — Twitch shows you offline. Results only save while you're live.", "error")
+                return
             if not resp.ok:
-                self.on_event(f"Royale ingest error: {data.get('detail')}", "error")
+                self.on_event(f"Royale ingest error ({resp.status_code}): {data.get('detail') or 'server error'}", "error")
                 return
             self.on_event(f"Royale saved — {data['entries_saved']} players", "success")
             threading.Thread(target=self._fetch_obs_stats, daemon=True).start()
@@ -283,6 +337,8 @@ class App(tk.Tk):
         self.watcher: Watcher | None = None
         self._retry_job = None
         self._chat_poll_job = None
+        self._was_connected = None
+        self._reconnect_remaining = 0
 
         self.title(f"Marbles on Teams  v{VERSION}")
         self.resizable(False, False)
@@ -414,6 +470,7 @@ class App(tk.Tk):
     # ── Connection ────────────────────────────────────────────────────────────
 
     def _try_connect(self):
+        self._cancel_reconnect()
         server = self.cfg.get("server_url", SERVER_URL)
         try:
             r = requests.get(server.rstrip("/") + "/admin/season/active", timeout=5)
@@ -421,12 +478,43 @@ class App(tk.Tk):
             season = data.get("season")
             label  = season["name"] if season else "No active season"
             self._set_status(True, label)
-            if self._retry_job:
-                self.after_cancel(self._retry_job)
-                self._retry_job = None
+            self._clear_status_click()
+            if self._was_connected is False:
+                self._log_msg("Reconnected to server.", "success")
+            self._was_connected = True
         except Exception:
-            self._set_status(False, "Unreachable")
-            self._retry_job = self.after(RETRY_INTERVAL * 1000, self._try_connect)
+            if self._was_connected is not False:   # first failure after being connected
+                self._log_msg(
+                    f"⚠ Can't reach server — auto-retrying every {RETRY_INTERVAL}s. "
+                    "Click the status indicator (top-right) to retry now.", "error")
+            self._was_connected = False
+            self._begin_reconnect_countdown(RETRY_INTERVAL)
+
+    def _begin_reconnect_countdown(self, seconds: int):
+        self._reconnect_remaining = seconds
+        for w in (self._status_lbl, self._status_dot):
+            w.configure(cursor="hand2")
+            w.bind("<Button-1>", lambda e: self._try_connect())
+        self._tick_reconnect()
+
+    def _tick_reconnect(self):
+        n = self._reconnect_remaining
+        if n <= 0:
+            self._try_connect()        # time's up — attempt now (reschedules on failure)
+            return
+        self._set_status(False, f"Reconnecting… {n}s")
+        self._reconnect_remaining = n - 1
+        self._retry_job = self.after(1000, self._tick_reconnect)
+
+    def _cancel_reconnect(self):
+        if self._retry_job:
+            self.after_cancel(self._retry_job)
+            self._retry_job = None
+
+    def _clear_status_click(self):
+        for w in (self._status_lbl, self._status_dot):
+            w.configure(cursor="")
+            w.unbind("<Button-1>")
 
     def _set_status(self, ok: bool, label: str):
         self._status_dot.configure(fg=GREEN if ok else RED)
