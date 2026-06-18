@@ -1,5 +1,5 @@
 """
-Marbles on Teams — Companion  v0.5.4.0
+Marbles on Teams — Companion  v0.5.4.1
 Watches the Marbles on Stream save folder and sends results to the MoT server.
 Requires: requests
 """
@@ -18,7 +18,7 @@ import requests
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
-VERSION        = "0.5.4.0"
+VERSION        = "0.5.4.1"
 _BASE          = Path(getattr(sys, "_MEIPASS", Path(__file__).parent))
 _EXE_DIR       = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).parent
 
@@ -447,7 +447,7 @@ class App(tk.Tk):
         # Save folder
         self._section(body, "Save Folder")
         folder_row = tk.Frame(body, bg=BG)
-        folder_row.pack(fill="x", pady=(0, 8))
+        folder_row.pack(fill="x", pady=(0, 4))
         self._folder_lbl = tk.Label(folder_row, text="Detecting…", bg=BG,
                                     fg=MUTED, font=FONT_SM, anchor="w")
         self._folder_lbl.pack(side="left", fill="x", expand=True)
@@ -455,10 +455,13 @@ class App(tk.Tk):
                   font=FONT_SM, relief="flat", bd=0, padx=8,
                   activebackground=BORDER,
                   command=self._browse_folder).pack(side="right")
-        self._autofind_btn = tk.Button(folder_row, text="Auto Find", bg=ACCENT, fg="#111",
-                  font=FONT_SM, relief="flat", bd=0, padx=8,
+        # Auto Find on its own row directly under Browse, so it's always visible
+        autofind_row = tk.Frame(body, bg=BG)
+        autofind_row.pack(fill="x", pady=(0, 8))
+        self._autofind_btn = tk.Button(autofind_row, text="Auto Find Save Folder",
+                  bg=ACCENT, fg="#111", font=FONT_B, relief="flat", bd=0, padx=10, pady=3,
                   activebackground=GOLD, command=self._auto_find_folder)
-        self._autofind_btn.pack(side="right", padx=(0, 4))
+        self._autofind_btn.pack(side="right")
 
         # Watcher status
         self._watch_lbl = tk.Label(body, text="", bg=BG, fg=MUTED, font=FONT_SM)
@@ -514,7 +517,7 @@ class App(tk.Tk):
                   activebackground=BORDER,
                   command=self._open_dashboard).pack(side="left")
 
-        self.geometry("420x560")
+        self.geometry("420x600")
 
     def _section(self, parent, label: str):
         tk.Label(parent, text=label.upper(), bg=BG, fg=MUTED,
