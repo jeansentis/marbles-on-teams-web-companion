@@ -1,5 +1,5 @@
 """
-Marbles on Teams — Companion  v0.5.4.1
+Marbles on Teams — Companion  v0.5.5.0
 Watches the Marbles on Stream save folder and sends results to the MoT server.
 Requires: requests
 """
@@ -18,7 +18,7 @@ import requests
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
-VERSION        = "0.5.4.1"
+VERSION        = "0.5.5.0"
 _BASE          = Path(getattr(sys, "_MEIPASS", Path(__file__).parent))
 _EXE_DIR       = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).parent
 
@@ -42,6 +42,10 @@ CONFIG_PATH = (
     Path(os.environ.get("APPDATA", ""))
     / "MarblesOnTeams" / "config.json"
 )
+# Results that can't be delivered right away are persisted here so a flaky
+# connection or a server hiccup never loses a race.
+QUEUE_PATH = CONFIG_PATH.parent / "outbox.json"
+MAX_QUEUE  = 500   # cap pending results if the server is unreachable for a long time
 
 WATCHED = ["LastSeasonRace.csv", "LastSeasonRoyale.csv", "LastCustomRaceMapPlayed.csv"]
 
@@ -192,6 +196,7 @@ class Watcher(threading.Thread):
         self.on_event   = on_event
         self._stop      = threading.Event()
         self._seen: dict[str, str] = {}
+        self._outbox    = self._load_outbox()   # pending results from earlier sessions
 
     def stop(self): self._stop.set()
 
@@ -262,7 +267,12 @@ class Watcher(threading.Thread):
         self._ensure_obs_files()
         self._heartbeat()
         self._fetch_obs_stats()
+        self._flush_outbox()        # deliver anything left over from a previous session
         _ping_counter = 0
+        _retry_counter = 0
+        # How many poll cycles equal one retry interval (flush queued results that
+        # previously failed, without hammering a down server every 2s).
+        retry_cycles = max(1, int(RETRY_INTERVAL / POLL_INTERVAL))
         while not self._stop.wait(POLL_INTERVAL):
             _ping_counter += 1
             if _ping_counter >= 15:
@@ -283,11 +293,28 @@ class Watcher(threading.Thread):
                 except Exception as exc:
                     self.on_event(f"Read error {filename}: {exc}", "error")
 
+            # Queue new results to disk the moment they're read, so they survive a
+            # failed send, a crash, or the next race overwriting the CSV.
+            new_results = False
             if "LastSeasonRace.csv" in changed:
                 map_csv = changed.get("LastCustomRaceMapPlayed.csv", "")
-                self._post_race(changed["LastSeasonRace.csv"], map_csv)
+                self._enqueue("race", {
+                    "streamer_username": self.username,
+                    "csv_content":       changed["LastSeasonRace.csv"],
+                    "map_csv_content":   map_csv,
+                })
+                new_results = True
             elif "LastSeasonRoyale.csv" in changed:
-                self._post_royale(changed["LastSeasonRoyale.csv"])
+                self._enqueue("royale", {
+                    "streamer_username": self.username,
+                    "csv_content":       changed["LastSeasonRoyale.csv"],
+                })
+                new_results = True
+
+            _retry_counter += 1
+            if new_results or _retry_counter >= retry_cycles:
+                _retry_counter = 0
+                self._flush_outbox()
 
     def _ensure_obs_files(self):
         """Create OBS txt files with default value 0 if they don't exist yet."""
@@ -321,54 +348,93 @@ class Watcher(threading.Thread):
         except Exception as exc:
             self.on_event(f"Stats fetch error: {exc}", "error")
 
-    def _post_race(self, content: str, map_csv: str = ""):
-        payload = {
-            "streamer_username": self.username,
-            "csv_content":       content,
-            "map_csv_content":   map_csv,
-        }
+    # ── Persistent send queue ───────────────────────────────────────────────────
+    # New results are appended to an on-disk outbox and sent from there. A result is
+    # only removed once the server accepts it (or definitively rejects it), so a
+    # network drop, a timeout, or a transient 5xx retries later instead of vanishing.
+
+    def _load_outbox(self) -> list:
         try:
-            resp = requests.post(self.server_url + "/ingest/race", json=payload, timeout=15)
-            try:
-                data = resp.json()
-            except Exception:
-                data = {}
-            if resp.status_code == 409:
-                self.on_event("Race not saved — Twitch shows you offline. Results only save while you're live.", "error")
-                return
-            if not resp.ok:
-                self.on_event(f"Race ingest error ({resp.status_code}): {data.get('detail') or 'server error'}", "error")
-                return
+            data = json.loads(QUEUE_PATH.read_text(encoding="utf-8"))
+            return data if isinstance(data, list) else []
+        except Exception:
+            return []
+
+    def _save_outbox(self):
+        try:
+            QUEUE_PATH.parent.mkdir(parents=True, exist_ok=True)
+            tmp = QUEUE_PATH.with_suffix(".tmp")
+            tmp.write_text(json.dumps(self._outbox), encoding="utf-8")
+            tmp.replace(QUEUE_PATH)   # atomic — never leave a half-written queue
+        except Exception as exc:
+            self.on_event(f"Could not save pending results to disk: {exc}", "error")
+
+    def _enqueue(self, kind: str, payload: dict):
+        self._outbox.append({"kind": kind, "payload": payload})
+        if len(self._outbox) > MAX_QUEUE:
+            self._outbox = self._outbox[-MAX_QUEUE:]   # keep the most recent
+        self._save_outbox()
+
+    def _flush_outbox(self):
+        """Try to deliver queued results oldest-first. Stops at the first one that
+        needs a retry so ordering is preserved and a down server isn't hammered."""
+        if not self._outbox:
+            return
+        if len(self._outbox) > 1:
+            self.on_event(f"Sending {len(self._outbox)} pending result(s)…", "info")
+        while self._outbox:
+            status = self._send_item(self._outbox[0])
+            if status == "retry":
+                break                       # leave it (and the rest) for next cycle
+            self._outbox.pop(0)             # "ok" or "drop" — done with this one
+            self._save_outbox()
+
+    def _send_item(self, item: dict) -> str:
+        """POST one queued result. Returns 'ok' (delivered), 'drop' (rejected for
+        good — don't retry), or 'retry' (transient failure — keep it queued)."""
+        kind     = item.get("kind")
+        payload  = item.get("payload") or {}
+        endpoint = "/ingest/race" if kind == "race" else "/ingest/royale"
+        label    = "Race" if kind == "race" else "Royale"
+        try:
+            resp = requests.post(self.server_url + endpoint, json=payload, timeout=15)
+        except requests.ConnectionError:
+            self.on_event("Cannot reach server — result queued, will retry.", "error")
+            return "retry"
+        except requests.Timeout:
+            self.on_event("Server timed out — result queued, will retry.", "error")
+            return "retry"
+        except Exception as exc:
+            self.on_event(f"Send failed: {exc} — result queued, will retry.", "error")
+            return "retry"
+
+        try:
+            data = resp.json()
+        except Exception:
+            data = {}
+
+        if resp.status_code == 409:
+            # Deliberate rejection (Twitch shows the streamer offline). Retrying later
+            # would save a stale race, so drop it.
+            self.on_event(f"{label} not saved — Twitch shows you offline. Results only save while you're live.", "error")
+            return "drop"
+        if resp.status_code >= 500:
+            self.on_event(f"{label} ingest server error ({resp.status_code}) — queued, will retry.", "error")
+            return "retry"
+        if not resp.ok:
+            # Other 4xx (e.g. 400 unparseable CSV) — won't ever succeed; drop it.
+            self.on_event(f"{label} ingest error ({resp.status_code}): {data.get('detail') or 'bad data'} — discarded.", "error")
+            return "drop"
+
+        if kind == "race":
             map_label = f' on "{data["map_name"]}"' if data.get("map_name") else ""
-            self.on_event(f"Race saved{map_label} — {data['entries_saved']} players", "success")
+            self.on_event(f"Race saved{map_label} — {data.get('entries_saved', '?')} players", "success")
             if data.get("new_world_record"):
                 self.on_event(f"  🏅 NEW WORLD RECORD — {data['wr_holder']}!", "wr")
-            threading.Thread(target=self._fetch_obs_stats, daemon=True).start()
-        except requests.ConnectionError:
-            self.on_event("Cannot reach server.", "error")
-        except Exception as exc:
-            self.on_event(f"POST failed: {exc}", "error")
-
-    def _post_royale(self, content: str):
-        payload = {"streamer_username": self.username, "csv_content": content}
-        try:
-            resp = requests.post(self.server_url + "/ingest/royale", json=payload, timeout=15)
-            try:
-                data = resp.json()
-            except Exception:
-                data = {}
-            if resp.status_code == 409:
-                self.on_event("Royale not saved — Twitch shows you offline. Results only save while you're live.", "error")
-                return
-            if not resp.ok:
-                self.on_event(f"Royale ingest error ({resp.status_code}): {data.get('detail') or 'server error'}", "error")
-                return
-            self.on_event(f"Royale saved — {data['entries_saved']} players", "success")
-            threading.Thread(target=self._fetch_obs_stats, daemon=True).start()
-        except requests.ConnectionError:
-            self.on_event("Cannot reach server.", "error")
-        except Exception as exc:
-            self.on_event(f"POST failed: {exc}", "error")
+        else:
+            self.on_event(f"Royale saved — {data.get('entries_saved', '?')} players", "success")
+        threading.Thread(target=self._fetch_obs_stats, daemon=True).start()
+        return "ok"
 
 # ── GUI ───────────────────────────────────────────────────────────────────────
 
