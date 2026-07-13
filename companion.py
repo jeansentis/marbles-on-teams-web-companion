@@ -1,5 +1,5 @@
 """
-Marbles on Teams — Companion  v0.5.5.0
+Marbles on Teams — Companion  v0.5.5.1
 Watches the Marbles on Stream save folder and sends results to the MoT server.
 Requires: requests
 """
@@ -18,7 +18,7 @@ import requests
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
-VERSION        = "0.5.5.0"
+VERSION        = "0.5.5.1"
 _BASE          = Path(getattr(sys, "_MEIPASS", Path(__file__).parent))
 _EXE_DIR       = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).parent
 
@@ -48,6 +48,31 @@ QUEUE_PATH = CONFIG_PATH.parent / "outbox.json"
 MAX_QUEUE  = 500   # cap pending results if the server is unreachable for a long time
 
 WATCHED = ["LastSeasonRace.csv", "LastSeasonRoyale.csv", "LastCustomRaceMapPlayed.csv"]
+
+
+def _read_result_file(path: Path) -> str:
+    """Read a MarblesOnStream result CSV, honoring its byte-order mark.
+
+    The game is built on Unreal, whose file writer silently switches the WHOLE file to
+    UTF-16 (with a BOM) the moment any racer or map name contains a non-ASCII character
+    (e.g. "よろしく"). Reading such a file as plain UTF-8 mojibakes every column — the
+    header no longer matches, so the server stores a race with no names, points, or
+    finish times (and world records stop registering). Decode by the actual BOM, then
+    fall back to UTF-8 and finally latin-1 so a result is never blanked or lost over an
+    encoding mismatch.
+    """
+    data = path.read_bytes()
+    if data.startswith(b"\xff\xfe"):
+        return data[2:].decode("utf-16-le", "replace")
+    if data.startswith(b"\xfe\xff"):
+        return data[2:].decode("utf-16-be", "replace")
+    if data.startswith(b"\xef\xbb\xbf"):
+        return data[3:].decode("utf-8", "replace")
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        return data.decode("latin-1")
+
 
 # ── Persistent config ─────────────────────────────────────────────────────────
 
@@ -287,7 +312,7 @@ class Watcher(threading.Thread):
                     if self._seen.get(filename) == fp:
                         continue
                     self._seen[filename] = fp
-                    changed[filename] = path.read_text(encoding="utf-8", errors="replace")
+                    changed[filename] = _read_result_file(path)
                 except FileNotFoundError:
                     pass
                 except Exception as exc:
@@ -297,7 +322,17 @@ class Watcher(threading.Thread):
             # failed send, a crash, or the next race overwriting the CSV.
             new_results = False
             if "LastSeasonRace.csv" in changed:
-                map_csv = changed.get("LastCustomRaceMapPlayed.csv", "")
+                # Always read the map file fresh from disk. The game writes it at a
+                # slightly different moment than the results file, so waiting for it
+                # to appear in the same poll cycle's `changed` set meant races usually
+                # shipped with an empty map_csv_content — and no WR check server-side.
+                try:
+                    map_csv = _read_result_file(self.folder / "LastCustomRaceMapPlayed.csv")
+                except FileNotFoundError:
+                    map_csv = ""
+                except Exception as exc:
+                    map_csv = ""
+                    self.on_event(f"Read error LastCustomRaceMapPlayed.csv: {exc}", "error")
                 self._enqueue("race", {
                     "streamer_username": self.username,
                     "csv_content":       changed["LastSeasonRace.csv"],
