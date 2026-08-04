@@ -1,8 +1,10 @@
 """
-Marbles on Teams — Companion  v0.5.5.1
+Marbles on Teams — Companion  v0.5.6.0
 Watches the Marbles on Stream save folder and sends results to the MoT server.
 Requires: requests
 """
+import csv
+import io
 import json
 import os
 import sys
@@ -18,7 +20,7 @@ import requests
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
-VERSION        = "0.5.5.1"
+VERSION        = "0.5.6.0"
 _BASE          = Path(getattr(sys, "_MEIPASS", Path(__file__).parent))
 _EXE_DIR       = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).parent
 
@@ -47,7 +49,17 @@ CONFIG_PATH = (
 QUEUE_PATH = CONFIG_PATH.parent / "outbox.json"
 MAX_QUEUE  = 500   # cap pending results if the server is unreachable for a long time
 
-WATCHED = ["LastSeasonRace.csv", "LastSeasonRoyale.csv", "LastCustomRaceMapPlayed.csv"]
+RESULT_FILES = {
+    "race": ("LastSeasonRace.csv", "LastSeasonRaceSummary.csv"),
+    "royale": ("LastSeasonRoyale.csv", "LastSeasonRoyaleSummary.csv"),
+}
+WATCHED = [
+    "LastSeasonRace.csv",
+    "LastSeasonRaceSummary.csv",
+    "LastSeasonRoyale.csv",
+    "LastSeasonRoyaleSummary.csv",
+    "LastCustomRaceMapPlayed.csv",
+]
 
 
 def _read_result_file(path: Path) -> str:
@@ -72,6 +84,40 @@ def _read_result_file(path: Path) -> str:
         return data.decode("utf-8")
     except UnicodeDecodeError:
         return data.decode("latin-1")
+
+
+def _first_csv_row(raw: str) -> dict[str, str]:
+    """Return the first data row with normalized headers for format pairing."""
+    if "\x00" in raw:
+        raw = raw.replace("\x00", "")
+    raw = raw.lstrip("\ufeff\ufffd")
+    header = next((line for line in raw.splitlines() if line.strip()), "")
+    delimiter = "\t" if "\t" in header else ","
+    try:
+        row = next(csv.DictReader(io.StringIO(raw.strip()), delimiter=delimiter), None)
+    except (csv.Error, StopIteration):
+        return {}
+    if not row:
+        return {}
+    return {
+        str(key).strip().lower(): str(value or "").strip()
+        for key, value in row.items()
+        if key is not None
+    }
+
+
+def _matching_summary(result_csv: str, summary_csv: str) -> str | None:
+    """Return the matching final v4 summary, blank for legacy, or None to wait."""
+    result_id = _first_csv_row(result_csv).get("snapshotid", "")
+    if not result_id:
+        return ""  # legacy result formats have no paired summary
+    summary = _first_csv_row(summary_csv)
+    if (
+        summary.get("snapshotid") != result_id
+        or summary.get("status", "").lower() != "final"
+    ):
+        return None
+    return summary_csv
 
 
 # ── Persistent config ─────────────────────────────────────────────────────────
@@ -222,6 +268,17 @@ class Watcher(threading.Thread):
         self._stop      = threading.Event()
         self._seen: dict[str, str] = {}
         self._outbox    = self._load_outbox()   # pending results from earlier sessions
+        self._pending_results: set[str] = set()
+        self._waiting_summary: dict[str, str] = {}
+        self._last_queued_snapshot: dict[str, str] = {}
+        for item in self._outbox:
+            kind = item.get("kind", "")
+            payload = item.get("payload") or {}
+            snapshot_id = _first_csv_row(payload.get("csv_content", "")).get(
+                "snapshotid", ""
+            )
+            if kind and snapshot_id:
+                self._last_queued_snapshot[kind] = snapshot_id
 
     def stop(self): self._stop.set()
 
@@ -286,6 +343,66 @@ class Watcher(threading.Thread):
             present = [f for f, ok in found.items() if ok]
             self.on_event("Save folder OK — found: " + ", ".join(present), "success")
 
+    def _try_queue_result(self, kind: str) -> str:
+        """Pair and queue one changed result. Returns queued, done, or wait."""
+        result_name, summary_name = RESULT_FILES[kind]
+        try:
+            result_csv = _read_result_file(self.folder / result_name)
+        except FileNotFoundError:
+            return "wait"
+        except Exception as exc:
+            self.on_event(f"Read error {result_name}: {exc}", "error")
+            return "wait"
+
+        result_id = _first_csv_row(result_csv).get("snapshotid", "")
+        if result_id and self._last_queued_snapshot.get(kind) == result_id:
+            return "done"
+
+        try:
+            summary_csv = _read_result_file(self.folder / summary_name)
+        except FileNotFoundError:
+            summary_csv = ""
+        except Exception as exc:
+            summary_csv = ""
+            self.on_event(f"Read error {summary_name}: {exc}", "error")
+
+        matching_summary = _matching_summary(result_csv, summary_csv)
+        if matching_summary is None:
+            if self._waiting_summary.get(kind) != result_id:
+                label = "Race" if kind == "race" else "Royale"
+                self.on_event(
+                    f"{label} captured — waiting for its matching final summary…",
+                    "info",
+                )
+                self._waiting_summary[kind] = result_id
+            return "wait"
+
+        payload = {
+            "streamer_username": self.username,
+            "csv_content": result_csv,
+            "summary_csv_content": matching_summary,
+        }
+        if kind == "race":
+            # Keep the custom-map file as the source of truth for WR detection.
+            try:
+                map_csv = _read_result_file(
+                    self.folder / "LastCustomRaceMapPlayed.csv"
+                )
+            except FileNotFoundError:
+                map_csv = ""
+            except Exception as exc:
+                map_csv = ""
+                self.on_event(
+                    f"Read error LastCustomRaceMapPlayed.csv: {exc}", "error"
+                )
+            payload["map_csv_content"] = map_csv
+
+        self._enqueue(kind, payload)
+        if result_id:
+            self._last_queued_snapshot[kind] = result_id
+        self._waiting_summary.pop(kind, None)
+        return "queued"
+
     def run(self):
         self._snapshot()
         self._check_files()
@@ -318,33 +435,27 @@ class Watcher(threading.Thread):
                 except Exception as exc:
                     self.on_event(f"Read error {filename}: {exc}", "error")
 
-            # Queue new results to disk the moment they're read, so they survive a
-            # failed send, a crash, or the next race overwriting the CSV.
+            # Schema v4 writes a result and summary separately. Mark either change
+            # as pending, then retry the pair each poll until their SnapshotIds match.
+            # Legacy results (no SnapshotId) still queue immediately without a summary.
+            for kind, (result_name, summary_name) in RESULT_FILES.items():
+                if result_name in changed:
+                    self._pending_results.add(kind)
+                elif summary_name in changed:
+                    try:
+                        current_result = _read_result_file(self.folder / result_name)
+                    except Exception:
+                        current_result = ""
+                    if _first_csv_row(current_result).get("snapshotid"):
+                        self._pending_results.add(kind)
+
             new_results = False
-            if "LastSeasonRace.csv" in changed:
-                # Always read the map file fresh from disk. The game writes it at a
-                # slightly different moment than the results file, so waiting for it
-                # to appear in the same poll cycle's `changed` set meant races usually
-                # shipped with an empty map_csv_content — and no WR check server-side.
-                try:
-                    map_csv = _read_result_file(self.folder / "LastCustomRaceMapPlayed.csv")
-                except FileNotFoundError:
-                    map_csv = ""
-                except Exception as exc:
-                    map_csv = ""
-                    self.on_event(f"Read error LastCustomRaceMapPlayed.csv: {exc}", "error")
-                self._enqueue("race", {
-                    "streamer_username": self.username,
-                    "csv_content":       changed["LastSeasonRace.csv"],
-                    "map_csv_content":   map_csv,
-                })
-                new_results = True
-            elif "LastSeasonRoyale.csv" in changed:
-                self._enqueue("royale", {
-                    "streamer_username": self.username,
-                    "csv_content":       changed["LastSeasonRoyale.csv"],
-                })
-                new_results = True
+            for kind in tuple(self._pending_results):
+                queue_status = self._try_queue_result(kind)
+                if queue_status != "wait":
+                    self._pending_results.discard(kind)
+                if queue_status == "queued":
+                    new_results = True
 
             _retry_counter += 1
             if new_results or _retry_counter >= retry_cycles:
