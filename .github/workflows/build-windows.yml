@@ -1,0 +1,46 @@
+name: Build Windows companion
+
+on:
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Install dependencies
+        run: python -m pip install "requests>=2.31.0" "pyinstaller==6.18.0"
+
+      - name: Run tests
+        run: python -m unittest discover -s tests -v
+
+      - name: Build executable
+        shell: pwsh
+        run: >-
+          pyinstaller companion.py
+          --onefile --windowed --clean
+          --name MarblesOnTeams
+          --icon logo.ico
+          --add-data "logo.ico;."
+          --distpath dist
+          --workpath build
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MarblesOnTeams-Windows-v0.5.6.0
+          path: dist/MarblesOnTeams.exe
+          if-no-files-found: error
+          retention-days: 14
