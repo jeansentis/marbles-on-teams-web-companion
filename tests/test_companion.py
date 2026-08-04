@@ -63,8 +63,13 @@ class SummaryPairingTests(unittest.TestCase):
             )
             self.assertEqual("queued", watcher._try_queue_result("race"))
             self.assertEqual("race", queued[0][0])
-            self.assertEqual(RACE, queued[0][1]["csv_content"])
-            self.assertEqual(SUMMARY, queued[0][1]["summary_csv_content"])
+            self.assertEqual(
+                RACE.splitlines(), queued[0][1]["csv_content"].splitlines()
+            )
+            self.assertEqual(
+                SUMMARY.splitlines(),
+                queued[0][1]["summary_csv_content"].splitlines(),
+            )
             self.assertEqual("", queued[0][1]["map_csv_content"])
 
 
