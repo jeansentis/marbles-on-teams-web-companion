@@ -30,7 +30,7 @@ jobs:
         shell: pwsh
         run: >-
           pyinstaller companion.py
-          --onefile --windowed --clean
+          --onedir --windowed --clean
           --name MarblesOnTeams
           --icon logo.ico
           --add-data "logo.ico;."
@@ -39,7 +39,7 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: MarblesOnTeams-Windows-v0.5.6.0
-          path: dist/MarblesOnTeams.exe
+          name: MarblesOnTeams-Windows-v0.5.6.0-onedir
+          path: dist/MarblesOnTeams/
           if-no-files-found: error
           retention-days: 14
